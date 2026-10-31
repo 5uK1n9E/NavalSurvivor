@@ -59,6 +59,20 @@ def _scale_to(img, target_size):
 
 
 # ─── 加载入口 ───────────────────────────────────────────
+_prepared = False
+
+def _apply_mute(muted):
+    """根据 muted 设置所有音效音量"""
+    vol = 0 if muted else 1
+    for s in (SOUND_HIT, SOUND_BOOM, SOUND_MISSILE):
+        if s:
+            s.set_volume(vol)
+    # 背景音乐
+    try:
+        pygame.mixer.music.set_volume(vol)
+    except Exception:
+        pass
+
 def prepare(muted=False):
     """
     在 pygame.init() 之后调用一次，加载并预处理所有贴图/音效。
@@ -66,13 +80,18 @@ def prepare(muted=False):
     将图片缩放到合适的游戏尺寸，背景图缩放到全屏。
     muted：是否静音，静音时所有音效加载后音量设为0。
     """
+    global _prepared
     global PLAYER_IMG, ENEMY_IMG_SMALL, ENEMY_IMG_MED, ENEMY_IMG_LARGE, BACKGROUND_IMG
     global DROP_IMG_FUEL, DROP_IMG_RECOVER, DROP_IMG_STRENGTHEN
     global DROP_IMG_SHIELD, DROP_IMG_FIRE_RATE, DROP_IMG_JAMMING
     global PLOT_CG, PLOT_ENDING, PLOT_WIN
     global SOUND_HIT, SOUND_BOOM, SOUND_MISSILE
-
-    PLAYER_IMG        = _scale_to(_rotate90_ccw(_load_img('player.png')),   C.PLAYER_SIZE)
+    #已加载
+    if _prepared:
+        _apply_mute(muted)
+        return
+    #首次加载
+    PLAYER_IMG = _scale_to(_rotate90_ccw(_load_img('player.png')), C.PLAYER_SIZE)
     ENEMY_IMG_SMALL   = _scale_to(_rotate90_ccw(_load_img('enemy1.png')), 85)   # scout - 轻型驱逐舰
     ENEMY_IMG_MED     = _scale_to(_rotate90_ccw(_load_img('enemy2.png')), 110)  # cruiser - 巡洋舰
     ENEMY_IMG_LARGE   = _scale_to(_rotate90_ccw(_load_img('enemy3.png')), 145) # battleship - 战列舰
@@ -113,11 +132,68 @@ def prepare(muted=False):
     SOUND_HIT  = _load_sound('sounds/hit.mp3')
     SOUND_BOOM = _load_sound('sounds/destroy.mp3')
     SOUND_MISSILE = _load_sound('sounds/missile.mp3')  # 可能不存在，返回 None
-    # 若当前静音，刚加载的音效也设为静音
-    if muted:
-        for s in (SOUND_HIT, SOUND_BOOM, SOUND_MISSILE):
-            if s: s.set_volume(0)
+    _prepared = True
+    _apply_mute(muted)
 
+# ─── 爆炸动画帧（boom1~6）加载缓存 ──────────────────
+_BOOM_IMGS = None
+
+def get_boom_imgs():
+    """
+    懒加载并缓存 boom1~6 爆炸动画帧。
+    首次调用时读取磁盘，之后返回同一份列表引用（只读，勿修改）。
+    失败时对应位置为 None。
+    """
+    global _BOOM_IMGS
+    if _BOOM_IMGS is None:
+        _BOOM_IMGS = []
+        for i in range(1, 7):
+            try:
+                _BOOM_IMGS.append(
+                    pygame.image.load(os.path.join(_ASSET_DIR, f'boom{i}.png'))
+                    .convert_alpha())
+            except Exception:
+                _BOOM_IMGS.append(None)
+    return _BOOM_IMGS
+
+
+# ─── 爆炸动画帧的「预缩放」缓存 ─────────────────────
+# key = (目标直径像素, 帧索引 0-5)，value = 已缩放的 Surface
+_BOOM_SCALED_CACHE = {}
+
+
+def get_scaled_boom(diameter, frame_idx):
+    """
+    获取已缩放好的爆炸帧。
+    diameter：目标显示直径（像素，最大宽/高）
+    frame_idx：0~5
+    返回 Surface，失败返回 None。
+    相同 (diameter, frame_idx) 的调用会命中缓存，避免每帧重复 smoothscale。
+    """
+    frame_idx = int(frame_idx) % 6
+    diameter = int(diameter)
+    key = (diameter, frame_idx)
+    cached = _BOOM_SCALED_CACHE.get(key)
+    if cached is not None or key in _BOOM_SCALED_CACHE:
+        return cached
+
+    imgs = get_boom_imgs()
+    base = imgs[frame_idx]
+    if base is None:
+        _BOOM_SCALED_CACHE[key] = None
+        return None
+
+    iw, ih = base.get_width(), base.get_height()
+    if diameter <= 0:
+        _BOOM_SCALED_CACHE[key] = base
+        return base
+    scale = diameter / max(iw, ih)
+    if not (0 < scale < 10):
+        _BOOM_SCALED_CACHE[key] = base
+        return base
+    scaled = pygame.transform.smoothscale(base, (max(1, int(iw * scale)), max(1, int(ih * scale))))
+    _BOOM_SCALED_CACHE[key] = scaled
+    return scaled
 
 def _load_sound(name):
     """加载音效文件，失败返回 None"""

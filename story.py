@@ -34,13 +34,18 @@ _scene_font   = None
 
 
 def _ensure_fonts():
-    """确保 pygame 已初始化并创建字体"""
     global _dialog_font, _dialog_name, _act_title, _scene_font
     if _dialog_font is None:
-        _dialog_font  = pygame.font.SysFont('microsoftyahei', 20)
-        _dialog_name  = pygame.font.SysFont('microsoftyahei', 22, bold=True)
-        _act_title    = pygame.font.SysFont('microsoftyahei', 32, bold=True)
-        _scene_font   = pygame.font.SysFont('microsoftyahei', 18)
+        try:
+            _dialog_font  = pygame.font.SysFont('microsoftyahei', 20)
+            _dialog_name  = pygame.font.SysFont('microsoftyahei', 22, bold=True)
+            _act_title    = pygame.font.SysFont('microsoftyahei', 32, bold=True)
+            _scene_font   = pygame.font.SysFont('microsoftyahei', 18)
+        except:
+            _dialog_font  = pygame.font.SysFont('', 20)
+            _dialog_name  = pygame.font.SysFont('', 22, bold=True)
+            _act_title    = pygame.font.SysFont('', 32, bold=True)
+            _scene_font   = pygame.font.SysFont('', 18)
 
 
 # ─── 解析 text.txt ───────────────────────────────────────

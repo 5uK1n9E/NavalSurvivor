@@ -11,6 +11,7 @@ import assets
 import entities
 import waves
 import ui
+import upgrades as ug
 
 
 class GameState:
@@ -29,6 +30,7 @@ class GameState:
         self.state = 'playing'   # playing / paused / win / lose
         self.win_why = ''
         self.hint_timer = C.HINT_DUR
+        self.lightning_lines = []
         # 游戏模式
         self.story_mode = False     # 是否故事模式
         self.story_battle = 0       # 当前第几战 (0/1/2)
@@ -39,8 +41,14 @@ class GameState:
         self.debug_open = False
         self.debug_pause_btn = None
         self.debug_arrow_btn = None
-        self.muted = False  # 静音状态（在 start() 中不重置，跨游戏保持）
+        self.muted = False  # 静音状态
         self.menu_mode = True  # 初始菜单状态
+        # 卡牌强化系统
+        self.last_card_wave = 0   # 上次出现卡牌的波次
+        self.showing_cards = False  # 是否正在显示卡牌选择
+        self.showing_player_panel = False  # 是否显示玩家属性面板
+        self.player_panel_page = 0  # 玩家面板当前页码
+        self._mouse_event_handled = False  # 本次帧是否已处理鼠标点击，防止else块重复执行
 
     def start(self, story_mode=False, story_battle=0, story_act_idx=0, story_endings=None):
         """重置所有状态，准备新游戏"""
@@ -59,19 +67,24 @@ class GameState:
         self.debug_open = False
         self.debug_pause_btn = None
         self.debug_arrow_btn = None
-        # self.muted = False  # 静音状态跨游戏保持，不重置
-        # 清空所有实体
-        self.bullets = []; self.enemy_bullets = []
-        self.enemies = []; self.drops = []
-        self.parts = []; self.booms = []; self.missiles = []
+        self.muted = False
+        self.menu_mode = True
+        # 卡牌强化系统
+        self.last_card_wave = 0
+        self.showing_cards = False
+        self.showing_player_panel = False
+        self.player_panel_page = 0
+        self._mouse_event_handled = False
 
 
 def init_game(story_mode=False, story_battle=0, story_act_idx=0, story_endings=None):
     """重置游戏状态（重新开始用）"""
     gs.player      = entities.Player()
+    ug.init_player_upgrades(gs.player)
     gs.bullets     = []; gs.enemy_bullets = []
     gs.enemies     = []; gs.drops       = []
     gs.parts       = []; gs.booms       = []; gs.missiles = []
+    gs.lightning_lines = []
     gs.wm          = waves.WaveManager()
     gs.wm.start(story_mode, story_battle)
     gs.frame = 0
@@ -91,11 +104,43 @@ def init_game(story_mode=False, story_battle=0, story_act_idx=0, story_endings=N
     gs.debug_pause_btn = None
     gs.debug_arrow_btn = None
     # gs.muted = False  # 静音状态跨游戏保持，不重置
+    # 卡牌强化系统
+    gs.last_card_wave = 0
+    gs.showing_cards = False
+    gs.showing_player_panel = False
+    gs.player_panel_page = 0
+    gs._mouse_event_handled = False
 
 
 def _handle_collisions():
     """处理所有碰撞：玩家子弹→敌人、敌弹→玩家（跳过无敌帧）、拾取道具"""
     p = gs.player
+
+    # 敌人燃烧DoT更新
+    dt = 1.0 / C.FPS
+    # 仅正常游戏运行状态才更新燃烧；paused / card_select 全部冻结燃烧计时
+    if gs.state == "playing":
+        for e in gs.enemies:
+            if not e['alive']:
+                continue
+            if e['burn_timer'] > 0:
+                e['burn_timer'] -= dt
+                e['burn_tick_acc'] += dt
+                if e['burn_tick_acc'] >= C.BURN_TICK_RATE:
+                    burn_dps = ug.get_burn_dps()
+                    dmg = burn_dps * C.BURN_TICK_RATE
+                    e['hp'] -= dmg
+                    e['burn_tick_acc'] = 0.0
+                    for _ in range(4):
+                        angle = random.uniform(0, math.tau)
+                        dist = random.uniform(0, e['sz'])
+                        px = e['x'] + math.cos(angle) * dist
+                        py = e['y'] + math.sin(angle) * dist
+                        gs.parts.append(entities.Particle(px, py, random.uniform(-1.2, 1.2), random.uniform(-1.5, 1.0),
+                                                          random.randint(12, 22), (255, 100, 30), 4))
+                    if e['hp'] <= 0:
+                        entities.hurt_enemy(e, 0)
+
 
     # 玩家子弹命中敌人
     for pb in gs.bullets:
@@ -105,8 +150,113 @@ def _handle_collisions():
             if not e['alive']:
                 continue
             if C.dst((pb.x, pb.y), (e['x'], e['y'])) < e['sz'] + pb.r:
-                entities.hurt_enemy(e, pb.dmg)
-                pb.alive = False
+                # =========无限穿透：跳过已命中的敌人=========
+                if e['uid'] in pb.hit_ids:
+                    continue
+                # =========超载反应判定=========
+                final_dmg = pb.dmg
+                overloaded = False
+                if (ug.get_overload_reaction_stack(gs.player) > 0
+                        and getattr(gs.player, 'chain_stack', 0) > 0
+                        and e.get('burn_timer', 0) > 0):
+                    mult = ug.get_overload_damage_mult(gs.player)
+                    final_dmg = int(pb.dmg * mult)
+                    overloaded = True
+                entities.hurt_enemy(e, final_dmg,allow_death_ring=not getattr(pb, 'is_ring_bullet', False))
+                # 超载视觉特效：以紫色为主的爆发粒子
+                if overloaded:
+                    cx, cy = e['x'], e['y']
+                    # 主力：深紫大粒子
+                    for _ in range(16):
+                        ang = random.uniform(0, math.tau)
+                        spd = random.uniform(2.0, 5.0)
+                        gs.parts.append(entities.Particle(
+                            cx, cy,
+                            math.cos(ang) * spd,
+                            math.sin(ang) * spd,
+                            random.randint(26, 40),
+                            (190, 80, 255),
+                            random.randint(6, 8)))
+                    # 亮紫核心
+                    for _ in range(10):
+                        ang = random.uniform(0, math.tau)
+                        spd = random.uniform(0.8, 2.5)
+                        gs.parts.append(entities.Particle(
+                            cx, cy,
+                            math.cos(ang) * spd,
+                            math.sin(ang) * spd,
+                            random.randint(20, 32),
+                            (230, 150, 255),
+                            6))
+                    # 橙色火花
+                    for _ in range(6):
+                        ang = random.uniform(0, math.tau)
+                        spd = random.uniform(2.5, 6.0)
+                        gs.parts.append(entities.Particle(
+                            cx, cy,
+                            math.cos(ang) * spd,
+                            math.sin(ang) * spd,
+                            random.randint(14, 22),
+                            (255, 180, 60),
+                            5))
+                # =========子弹穿透 / 销毁逻辑========
+                pb.hit_ids.add(e['uid'])
+                if pb.infinite_pierce:
+                    pass  # 无限穿透，不销毁
+                elif pb.pierce > 0:
+                    pb.pierce -= 1
+                else:
+                    pb.alive = False
+                # =========附加燃烧效果==========
+                burn_dps = ug.get_burn_dps()
+                if burn_dps > 0:
+                    dur = ug.get_burn_duration_sec()
+                    # 刷新燃烧持续时间
+                    e['burn_timer'] = dur
+                    e['burn_tick_acc'] = 0.0
+                # ==========连锁闪电逻辑==========
+                if gs.state == "playing":
+                    chain_radius, chain_dmg = ug.get_chain_lightning_info(gs.player)
+                    if chain_radius > 0:
+                        hit_list = []
+                        hit_this_frame = set()
+                        hit_this_frame.add(id(e))  # 原始被击中本体标记
+                        for other in gs.enemies:
+                            if not other['alive']:
+                                continue
+                            if other is e:
+                                continue
+                            if id(other) in hit_this_frame:
+                                continue
+                            dx = other['x'] - e['x']
+                            dy = other['y'] - e['y']
+                            dist_sq = dx * dx + dy * dy
+                            if dist_sq <= chain_radius * chain_radius:
+                                hit_list.append((dist_sq, other))
+                        # 由近到远排序，限制数量
+                        hit_list.sort(key=lambda x: x[0])
+                        hit_list = hit_list[:C.CHAIN_LIGHTNING_MAX_TARGET]
+
+                        for _, target in hit_list:
+                            hit_this_frame.add(id(target))
+                            entities.hurt_enemy(target, chain_dmg)
+                            # 元组：起点、终点、闪电存活帧数(12帧≈0.2秒，调大更久)
+                            gs.lightning_lines.append((e['x'], e['y'], target['x'], target['y'], 12))
+                            # 连锁目标生成蓝色粒子增强特效
+                            for _ in range(6):
+                                angle = random.uniform(0, math.tau)
+                                dist = random.uniform(0, 14)
+                                px = target['x'] + math.cos(angle) * dist
+                                py = target['y'] + math.sin(angle) * dist
+                                gs.parts.append(entities.Particle(
+                                    px, py,
+                                    random.uniform(-2.5, 2.5),
+                                    random.uniform(-2.5, 2.5),
+                                    random.randint(15, 24),
+                                    (120, 180, 255),
+                                    4
+                                ))
+
                 for _ in range(3):
                     gs.parts.append(entities.Particle(
                         pb.x, pb.y,
@@ -144,15 +294,27 @@ def _handle_collisions():
 def _handle_missile_collisions():
     """处理导弹对玩家和敌人的伤害（爆炸期间持续伤害）"""
     p = gs.player
+    # 爆破偏转（missile_shunt）：玩家受伤降低、敌人受伤提高
+    p_shunt, e_shunt = ug.get_missile_shunt_multipliers(gs.player)
+    # 强化轰炸（bombardment）：双方伤害等倍提升
+    bomb_mult = ug.get_bombardment_damage_mult(gs.player)
+    # 轰炸协议（bombardment_mode）：对敌伤害额外加成，且不伤玩家
+    barrage = ug.is_bombardment_mode_active(p)
+    mode_dmg_mult = C.BOMBARDMENT_MODE_DMG_MULT if barrage else 1.0
+    p_mult = p_shunt * bomb_mult
+    e_mult = e_shunt * bomb_mult * mode_dmg_mult
     for m in gs.missiles:
         if m.state == 'explode':
-            # 对玩家造成伤害（每10帧一次）
-            if m.timer % 10 == 0 and C.dst((m.x, m.y), (p.x, p.y)) < m.radius + p.r:
-                p.hurt(C.MISSILE_DAMAGE)
+            # 对玩家造成伤害（轰炸协议激活时跳过）
+            if not barrage:
+                if m.timer % 10 == 0 and C.dst((m.x, m.y), (p.x, p.y)) < m.radius + p.r:
+                    dmg = C.MISSILE_DAMAGE * p_mult
+                    p.hurt(dmg)
             # 对敌人造成伤害（每10帧一次）
             for e in gs.enemies:
                 if e['alive'] and C.dst((m.x, m.y), (e['x'], e['y'])) < m.radius + e['sz']:
-                    e['hp'] -= C.MISSILE_ENEMY_DAMAGE
+                    dmg = C.MISSILE_ENEMY_DAMAGE * e_mult
+                    e['hp'] -= dmg
                     if e['hp'] <= 0:
                         entities.hurt_enemy(e, 999)
 
@@ -169,12 +331,42 @@ def _cleanup():
 
 
 def _check_end_condition():
-    """判定胜负：燃料/耐久耗尽则失败，完成 WIN_WAVES 波次则胜利；中途触发剧情"""
+    """判定胜负：燃料/耐久耗尽则失败；无尽模式（生存模式）无波次终点"""
     p = gs.player
     if p.fuel <= 0:
         gs.state, gs.win_why = 'lose', '燃料耗尽'
     elif p.dur <= 0:
-        gs.state, gs.win_why = 'lose', '耐久归零'
+        #耐久归零时若仍有复活机会
+        if getattr(p, 'revive_stack', 0) > 0 and not getattr(p, 'revive_used', False):
+            p.revive_used = True
+            p.dur = max(1, int(ug.get_effective_max_dur() * C.REVIVE_HEAL_RATIO))
+            p.invincible = C.REVIVE_INVINCIBLE_FRAMES
+            # 金色爆发特效
+            cx, cy = p.x, p.y
+            for _ in range(40):
+                ang = random.uniform(0, math.tau)
+                spd = random.uniform(1.5, 5.5)
+                col = random.choice([(255, 215, 0), (255, 240, 120), (255, 180, 40)])
+                gs.parts.append(entities.Particle(
+                    cx, cy,
+                    math.cos(ang) * spd,
+                    math.sin(ang) * spd,
+                    random.randint(30, 50),
+                    col,
+                    random.randint(6, 9)))
+            # 一圈金色光环粒子
+            for i in range(24):
+                ang = math.tau * i / 24
+                dist = p.r + 60
+                gs.parts.append(entities.Particle(
+                    cx + math.cos(ang) * dist,
+                    cy + math.sin(ang) * dist,
+                    -math.cos(ang) * 3.0,
+                    -math.sin(ang) * 3.0,
+                    28, (255, 230, 120), 5))
+            # 不改变 state，游戏继续
+        else:
+            gs.state, gs.win_why = 'lose', '耐久归零'
     elif gs.story_mode and gs.state != 'story_act':
         # 故事模式：第二战第3波开始时触发剧情（wave_just_started 保证只触发一次）
         if gs.story_battle == 1 and gs.wm.wave == 3 and gs.wm.wave_just_started:
@@ -185,25 +377,35 @@ def _check_end_condition():
         elif gs.wm.wave >= gs.wm.target_waves and not gs.wm.queue and not gs.enemies:
             gs.state = 'win'
             gs.win_why = f'第 {gs.story_battle + 1} 战胜利'
-    elif gs.wm.wave >= C.WIN_WAVES and not gs.wm.queue and not gs.enemies:
-        gs.state, gs.win_why = 'win', f'坚守阵地成功！最终得分：{p.score}'
-    elif gs.wm.wave >= C.WIN_WAVES and not gs.wm.queue and not gs.enemies:
-        gs.state, gs.win_why = 'win', f'坚守阵地成功！最终得分：{p.score}'
+    # 无尽模式：不再限制 WIN_WAVES 波次，燃料或耐久耗尽才失败
+    # 注：卡牌触发已移至游戏主循环中 wm.update() 之前，此处不再重复检查
 
 
 def _check_missile_spawn():
-    """生成导弹轰炸区：生存模式第6波后，故事模式第三战"""
-    if gs.story_mode:
-        if gs.story_battle != 2:
-            return
-    else:
-        if gs.wm.wave < 6:
-            return
+    """生成导弹轰炸区：生存模式第6波后，故事模式第三战；轰炸协议激活时无视门槛"""
+    barrage = ug.is_bombardment_mode_active(gs.player)
+    # 门槛判断：轰炸协议激活时跳过波次/故事战门槛
+    if not barrage:
+        if gs.story_mode:
+            if gs.story_battle != 2:
+                return
+        else:
+            if gs.wm.wave < 6:
+                return
     gs.missile_timer += 1
-    if gs.missile_timer < C.MISSILE_MIN_SPACING:
+    # 间隔：轰炸协议使用专属固定间隔
+    if barrage:
+        spacing = C.BOMBARDMENT_MODE_SPACING
+    else:
+        spacing = ug.get_effective_missile_spacing()
+    if gs.missile_timer < spacing:
         return
     gs.missile_timer = 0
-    count = random.randint(C.MISSILE_COUNT_MIN, C.MISSILE_COUNT_MAX)
+    lo, hi = ug.get_effective_missile_count_range()
+    if barrage:
+        lo += C.BOMBARDMENT_MODE_COUNT_BONUS
+        hi += C.BOMBARDMENT_MODE_COUNT_BONUS
+    count = random.randint(lo, hi)
     for _ in range(count):
         x = random.randint(C.MISSILE_RADIUS + 20, C.W - C.MISSILE_RADIUS - 20)
         y = random.randint(C.MISSILE_RADIUS + 20, C.H - C.MISSILE_RADIUS - 20)
@@ -217,7 +419,7 @@ def _handle_debug_actions():
     # 固定耐久/燃料只在面板打开时生效
     if gs.debug_open and gs.state == 'playing':
         if getattr(gs, '_debug_fixed_dur', False):
-            gs.player.dur = C.MAX_DUR
+            gs.player.dur = ug.get_effective_max_dur()
         if getattr(gs, '_debug_fixed_fuel', False):
             gs.player.fuel = C.MAX_FUEL
 
@@ -259,8 +461,35 @@ def _render_base(screen):
     for bm in gs.booms:       bm.draw(screen)
     for m  in gs.missiles:    m.draw(screen)
 
+    # ---------------- 连锁闪电绘制 ----------------
+    def draw_zigzag_lightning(surf, x1, y1, x2, y2):
+        subdiv = 6
+        pts = [(x1, y1)]
+        for i in range(1, subdiv):
+            t = i / subdiv
+            nx = x1 * (1 - t) + x2 * t
+            ny = y1 * (1 - t) + y2 * t
+            off = 14
+            nx += random.uniform(-off, off)
+            ny += random.uniform(-off, off)
+            pts.append((nx, ny))
+        pts.append((x2, y2))
+        # 多层线条，外粗亮白，中层浅蓝，内层细亮蓝
+        pygame.draw.lines(surf, (240, 248, 255), False, pts, 5)
+        pygame.draw.lines(surf, (160, 200, 255), False, pts, 3)
+        pygame.draw.lines(surf, (200, 230, 255), False, pts, 1)
+
+    # 更新闪电生命周期，绘制还活着的闪电
+    new_lightning = []
+    for item in gs.lightning_lines:
+        x1, y1, x2, y2, life = item
+        if life > 0:
+            draw_zigzag_lightning(screen, x1, y1, x2, y2)
+            new_lightning.append((x1, y1, x2, y2, life - 1))
+    gs.lightning_lines = new_lightning
+    # ----------------------------------------------------------------
     ui.draw_hud(screen)
-    gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn = ui.draw_pause_button(screen)
+    gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
 
     # 十字准星
     mx, my = gs.mouse_pos
@@ -274,7 +503,9 @@ def _render_base(screen):
 
     # 焦点提示
     if not pygame.display.get_active() and gs.state == 'playing':
-        screen.fill((0, 0, 0, 165))
+        overlay = pygame.Surface((C.W, C.H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 165))
+        screen.blit(overlay, (0, 0))
         t = ui._fontb.render('请点击游戏窗口', True, (255, 220, 70))
         screen.blit(t, (C.W // 2 - t.get_width() // 2, C.H // 2 - 25))
         t = ui._font.render('点击窗口后 WASD 即可控制移动', True, C.C_DIM)
@@ -286,6 +517,10 @@ def _render_base(screen):
 def _render(screen):
     """渲染一帧：背景 + 海浪 + 所有实体 + HUD + 准星 + 提示（不含按钮/面板）"""
     _render_base(screen)
+
+    # 玩家属性面板
+    if gs.showing_player_panel and gs.state in ('playing', 'paused'):
+        ui.draw_player_panel(screen, gs.player_panel_page)
 
     # 结束画面（包含 story_act 中途剧情）
     if gs.state in ('win', 'lose', 'story_act'):
@@ -392,10 +627,12 @@ waves.game_state = gs
 
 def run():
     global gs
+    import upgrades
     gs = GameState()
     entities.game_state = gs
     waves.game_state = gs
     ui.game_state = gs
+    upgrades.game_state = gs
     gs.start()
     # 手动触发字体初始化（保险）
     ui._ensure_fonts()
@@ -405,6 +642,7 @@ def run():
     gs.clock = pygame.time.Clock()
     gs.menu_mode = True   # 初始在菜单状态
     gs.mouse_pos = (C.W // 2, C.H // 2)
+    gs.screen = screen   # 将 screen 存入 gs，供 upgrades 等模块使用
     # 加载故事数据（仅故事模式需要）
     import story
     gs.story_acts, gs.story_endings = story.load_story()
@@ -460,15 +698,30 @@ def run():
                         if gs.state == 'playing' or gs.state == 'paused':
                             _toggle_pause()
                         break
+                    # 翻页处理（仅玩家面板开启时）
+                    if gs.showing_player_panel:
+                        if ev.key in (pygame.K_LEFT, pygame.K_PAGEUP):
+                            gs.player_panel_page = max(0, gs.player_panel_page - 1)
+                            break
+                        if ev.key in (pygame.K_RIGHT, pygame.K_PAGEDOWN):
+                            gs.player_panel_page = min(2, gs.player_panel_page + 1)
+                            break
                 elif ev.type == pygame.MOUSEMOTION:
                     gs.mouse_pos = ev.pos
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     pos = pygame.mouse.get_pos()
+                    gs._mouse_event_handled = True
 
                     if gs.state == 'paused':
-                        # 暂停时：先检测调试面板，再检测暂停菜单
-                        if gs.debug_open and getattr(gs, '_debug_btns', []):
-                            for action, btn in gs._debug_btns:
+                        # 调试面板边界矩形
+                        _DEBUG_W = 260
+                        debug_panel_rect = pygame.Rect(C.W - _DEBUG_W - 20, 50, _DEBUG_W, C.H - 100)
+                        # 只有点击落在调试面板内，才处理调试面板按钮
+                        if gs.debug_open and getattr(gs, '_debug_btns', []) and debug_panel_rect.collidepoint(pos):
+                            for entry in gs._debug_btns:
+                                action, btn, *rest = entry
+                                is_maxed = rest[0] if rest else False
+
                                 if btn.collidepoint(pos):
                                     if action == 'fixed_dur':
                                         gs._debug_fixed_dur = not getattr(gs, '_debug_fixed_dur', False)
@@ -479,15 +732,30 @@ def run():
                                         gs.wm.queue = []
                                         gs.wm.timer = 0
                                         gs.wm.stimer = 0
+                                        gs.last_card_wave = gs.wm.wave
+                                        gs.showing_cards = False
+                                        gs.state = 'playing'
                                     elif action == 'dmg_up':
                                         gs.player.bdmg += 10
                                     elif action == 'clear':
                                         gs.enemies = []
                                         gs.wm.queue = []
+                                        gs.last_card_wave = gs.wm.wave
+                                        gs.showing_cards = False
+                                        gs.state = 'playing'
                                     elif action == 'die':
                                         gs.player.dur = 0
-                                    break
+                                    elif action.startswith('upgrade_'):
+                                        if is_maxed:
+                                            break
+                                        key = action.replace('upgrade_', '')
+                                        upg = next((u for u in ug.ALL_UPGRADES if u.key == key), None)
+                                        if upg:
+                                            ug.apply_upgrade(gs.player, upg)
+                                        break
+
                             else:
+                                # 点击在调试面板框内，但没有点任何调试按钮：处理箭头、静音
                                 if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pos):
                                     gs.debug_open = not gs.debug_open
                                 elif getattr(gs, 'mute_btn', None) and gs.mute_btn.collidepoint(pos):
@@ -500,22 +768,30 @@ def run():
                                         pygame.mixer.music.set_volume(1)
                                         for s in (assets.SOUND_HIT, assets.SOUND_BOOM, assets.SOUND_MISSILE):
                                             if s: s.set_volume(1)
-                            continue
                         # 暂停菜单按钮
-                        if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pos):
-                            gs.debug_open = not gs.debug_open
-                            continue
-                        if getattr(gs, 'mute_btn', None) and gs.mute_btn.collidepoint(pos):
-                            gs.muted = not gs.muted
-                            if gs.muted:
-                                pygame.mixer.music.set_volume(0)
-                                for s in (assets.SOUND_HIT, assets.SOUND_BOOM, assets.SOUND_MISSILE):
-                                    if s: s.set_volume(0)
-                            else:
-                                pygame.mixer.music.set_volume(1)
-                                for s in (assets.SOUND_HIT, assets.SOUND_BOOM, assets.SOUND_MISSILE):
-                                    if s: s.set_volume(1)
-                            continue
+                        else:
+                            # 点击不在调试面板区域：处理箭头、面板、静音按钮（不在调试面板框，但是右上角小图标）
+                            if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pos):
+                                gs.debug_open = not gs.debug_open
+                                continue
+                            if getattr(gs, 'panel_btn', None) and gs.panel_btn.collidepoint(pos):
+                                gs.showing_player_panel = not gs.showing_player_panel
+                                if gs.showing_player_panel:
+                                    gs.state = 'paused'
+                                else:
+                                    gs.state = 'playing'
+                                continue
+                            if getattr(gs, 'mute_btn', None) and gs.mute_btn.collidepoint(pos):
+                                gs.muted = not gs.muted
+                                if gs.muted:
+                                    pygame.mixer.music.set_volume(0)
+                                    for s in (assets.SOUND_HIT, assets.SOUND_BOOM, assets.SOUND_MISSILE):
+                                        if s: s.set_volume(0)
+                                else:
+                                    pygame.mixer.music.set_volume(1)
+                                    for s in (assets.SOUND_HIT, assets.SOUND_BOOM, assets.SOUND_MISSILE):
+                                        if s: s.set_volume(1)
+                                continue
                         # 继续/重新开始/返回菜单
                         btn_w, btn_h = 280, 52
                         y_offset = C.H // 2 - 96
@@ -527,7 +803,12 @@ def run():
                             continue
                         if restart_btn.collidepoint(pos):
                             assets.prepare(gs.muted)
-                            init_game()
+                            init_game(
+                                story_mode=gs.story_mode,
+                                story_battle=gs.story_battle,
+                                story_act_idx=gs.story_act_idx,
+                                story_endings=gs.story_endings,
+                            )
                             continue
                         if menu_btn.collidepoint(pos):
                             gs.menu_mode = True
@@ -535,7 +816,10 @@ def run():
                     else:
                         # 游戏中：先检测调试面板，再检测其他按钮
                         if gs.debug_open and getattr(gs, '_debug_btns', []):
-                            for action, btn in gs._debug_btns:
+                            for entry in gs._debug_btns:
+                                action, btn, *rest = entry
+                                is_maxed = rest[0] if rest else False
+
                                 if btn.collidepoint(pos):
                                     if action == 'fixed_dur':
                                         gs._debug_fixed_dur = not getattr(gs, '_debug_fixed_dur', False)
@@ -546,14 +830,28 @@ def run():
                                         gs.wm.queue = []
                                         gs.wm.timer = 0
                                         gs.wm.stimer = 0
+                                        gs.last_card_wave = gs.wm.wave
+                                        gs.showing_cards = False
+                                        gs.state = 'playing'
                                     elif action == 'dmg_up':
                                         gs.player.bdmg += 10
                                     elif action == 'clear':
                                         gs.enemies = []
                                         gs.wm.queue = []
+                                        gs.last_card_wave = gs.wm.wave
+                                        gs.showing_cards = False
+                                        gs.state = 'playing'
                                     elif action == 'die':
                                         gs.player.dur = 0
+                                    elif action.startswith('upgrade_'):
+                                        if is_maxed:
+                                            break
+                                        key = action.replace('upgrade_', '')
+                                        upg = next((u for u in ug.ALL_UPGRADES if u.key == key), None)
+                                        if upg:
+                                            ug.apply_upgrade(gs.player, upg)
                                     break
+
                             else:
                                 if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pos):
                                     gs.debug_open = not gs.debug_open
@@ -573,6 +871,13 @@ def run():
                         if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pos):
                             gs.debug_open = not gs.debug_open
                             continue
+                        if getattr(gs, 'panel_btn', None) and gs.panel_btn.collidepoint(pos):
+                            gs.showing_player_panel = not gs.showing_player_panel
+                            if gs.showing_player_panel:
+                                gs.state = 'paused'
+                            else:
+                                gs.state = 'playing'
+                            continue
                         if gs.debug_pause_btn and gs.debug_pause_btn.collidepoint(pos):
                             _toggle_pause()
                         elif getattr(gs, 'mute_btn', None) and gs.mute_btn.collidepoint(pos):
@@ -588,64 +893,71 @@ def run():
             else:  # 仅当事件循环没有 break 时才执行
                 keys = pygame.key.get_pressed()
 
-                if gs.state in ('playing', 'story_act'):
-                    # 操作提示计时
-                    if gs.hint_timer > 0:
-                        gs.hint_timer -= 1
+                if not gs._mouse_event_handled:
+                    if gs.state in ('playing', 'story_act', 'card_select'):
+                        # 操作提示计时
+                        if gs.hint_timer > 0:
+                            gs.hint_timer -= 1
 
-                    # 更新
-                    gs.player.update(keys, gs.mouse_pos)
-                    for b   in gs.bullets:      b.update()
-                    for b   in gs.enemy_bullets: b.update()
-                    for e   in gs.enemies:      entities.update_enemy(e, gs.player)
-                    for d   in gs.drops:        d.update()
-                    for pt  in gs.parts:        pt.update()
-                    for bm  in gs.booms:        bm.update()
-                    for m   in gs.missiles:     m.update()
+                        # 更新
+                        gs.player.update(keys, gs.mouse_pos)
+                        for b   in gs.bullets:      b.update()
+                        for b   in gs.enemy_bullets: b.update()
+                        for e   in gs.enemies:      entities.update_enemy(e, gs.player)
+                        for d   in gs.drops:        d.update()
+                        for pt  in gs.parts:        pt.update()
+                        for bm  in gs.booms:        bm.update()
+                        for m   in gs.missiles:     m.update()
 
-                    _handle_collisions()
-                    _handle_missile_collisions()
-                    _handle_debug_actions()
-                    _cleanup()
-                    gs.wm.update()
-                    _check_missile_spawn()
-                    _check_end_condition()
+                        _handle_collisions()
+                        _handle_missile_collisions()
+                        _handle_debug_actions()
+                        _cleanup()
+                        gs.wm.update()
+                        _check_missile_spawn()
+                        _check_end_condition()
 
-                # 所有非暂停状态都渲染（含 win/lose 用于触发结束画面）
-                if gs.state not in ('paused',):
+                # 渲染分支
+                if gs.state == 'card_select':
+                    ug.show_card_selection(gs.clock)
+                    gs.showing_cards = False
+                    gs.state = 'playing'
+                    gs.frame += 1
+                    gs.clock.tick(C.FPS)
+                    continue
+                elif gs.state == 'paused':
+                    if gs.debug_open and gs.showing_player_panel:
+                        _render_base(screen)
+                        gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
+                        gs._debug_btns = ui.draw_debug_panel(screen, gs.debug_open, gs.player)
+                        ui.draw_player_panel(screen, gs.player_panel_page)
+                        pygame.display.flip()
+                    elif gs.debug_open:
+                        _render_base(screen)
+                        gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
+                        gs._debug_btns = ui.draw_debug_panel(screen, gs.debug_open, gs.player)
+                        pygame.display.flip()
+                    elif gs.showing_player_panel:
+                        _render_base(screen)
+                        gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
+                        ui.draw_player_panel(screen, gs.player_panel_page)
+                        pygame.display.flip()
+                    else:
+                        _render_base(screen)
+                        gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
+                        pause_btns = ui.draw_pause_menu(screen, gs.clock)
+                        if gs.debug_arrow_btn and gs.debug_arrow_btn.collidepoint(pygame.mouse.get_pos()):
+                            gs.debug_open = True
+                            gs._debug_btns = ui.draw_debug_panel(screen, True, gs.player)
+                else:
                     _render(screen)
-                    # 绘制按钮和调试面板
-                    gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn = ui.draw_pause_button(screen)
+                    gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn, gs.panel_btn = ui.draw_pause_button(screen)
                     if gs.debug_open:
                         gs._debug_btns = ui.draw_debug_panel(screen, gs.debug_open, gs.player)
-                    # 所有渲染完成后统一刷新
                     pygame.display.flip()
                     gs.frame += 1
                     gs.clock.tick(C.FPS)
-                elif gs.state == 'paused':
-                    # 暂停：停止一切更新，仅渲染暂停菜单
-                    # 先渲染基础画面 + 按钮 + 调试面板
-                    _render_base(screen)
-                    gs.debug_pause_btn, gs.debug_arrow_btn, gs.mute_btn = ui.draw_pause_button(screen)
-                    if gs.debug_open:
-                        gs._debug_btns = ui.draw_debug_panel(screen, gs.debug_open, gs.player)
-                    # 显示暂停菜单（非阻塞）+ 获取按钮
-                    pause_btns = ui.draw_pause_menu(screen, gs.clock)
-                    pygame.display.flip()
-                    if not (gs.debug_open and getattr(gs, '_debug_btns', [])):
-                        for btn in pause_btns:
-                            if btn.collidepoint(pos):
-                                if btn == pause_btns[0]:  # continue
-                                    gs.state = 'playing'
-                                elif btn == pause_btns[1]:  # restart
-                                    assets.prepare(gs.muted)
-                                    init_game()
-                                elif btn == pause_btns[2]:  # menu
-                                    gs.menu_mode = True
-                                break
-                else:
-                    # 等待 _render 中的结束画面处理
-                    pass
+                gs._mouse_event_handled = False
                 continue  # 跳过 break，继续游戏循环
 
         # ESC 跳出游戏循环，回到菜单
